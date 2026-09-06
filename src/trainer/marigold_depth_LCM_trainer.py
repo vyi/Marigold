@@ -39,9 +39,7 @@ import torch
 from diffusers import DDPMScheduler, LCMScheduler, UNet2DConditionModel
 from omegaconf import OmegaConf
 from PIL import Image
-from torch.nn import Conv2d
-from torch.nn.parameter import Parameter
-from torch.optim import Adam, AdamW
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -59,8 +57,6 @@ from src.util.logging_util import eval_dic_to_text, tb_logger
 from src.util.loss import get_loss
 from src.util.lr_scheduler import IterExponential
 from src.util.metric import MetricTracker
-from src.util.multi_res_noise import multi_res_noise_like
-from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
 from src.trainer.marigold_depth_trainer import MarigoldDepthTrainer
 
@@ -70,11 +66,14 @@ def extract_into_tensor(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+
 class DDIMSolver:
     def __init__(self, alpha_cumprods, timesteps=1000, ddim_timesteps=50):
         # DDIM sampling parameters
         step_ratio = timesteps // ddim_timesteps
-        self.ddim_timesteps = (np.arange(1, ddim_timesteps + 1) * step_ratio).round().astype(np.int64) - 1
+        self.ddim_timesteps = (
+            np.arange(1, ddim_timesteps + 1) * step_ratio
+        ).round().astype(np.int64) - 1
         self.ddim_alpha_cumprods = alpha_cumprods[self.ddim_timesteps]
         self.ddim_alpha_cumprods_prev = np.asarray(
             [alpha_cumprods[0]] + alpha_cumprods[self.ddim_timesteps[:-1]].tolist()
@@ -91,10 +90,13 @@ class DDIMSolver:
         return self
 
     def ddim_step(self, pred_x0, pred_noise, timestep_index):
-        alpha_cumprod_prev = extract_into_tensor(self.ddim_alpha_cumprods_prev, timestep_index, pred_x0.shape)
+        alpha_cumprod_prev = extract_into_tensor(
+            self.ddim_alpha_cumprods_prev, timestep_index, pred_x0.shape
+        )
         dir_xt = (1.0 - alpha_cumprod_prev).sqrt() * pred_noise
         x_prev = alpha_cumprod_prev.sqrt() * pred_x0 + dir_xt
         return x_prev
+
 
 # From LCMScheduler.get_scalings_for_boundary_condition_discrete
 def scalings_for_boundary_conditions(timestep, sigma_data=0.5, timestep_scaling=10.0):
@@ -105,7 +107,9 @@ def scalings_for_boundary_conditions(timestep, sigma_data=0.5, timestep_scaling=
 
 
 # Compare LCMScheduler.step, Step 4
-def get_predicted_original_sample(model_output, timesteps, sample, prediction_type, alphas, sigmas):
+def get_predicted_original_sample(
+    model_output, timesteps, sample, prediction_type, alphas, sigmas
+):
     alphas = extract_into_tensor(alphas, timesteps, sample.shape)
     sigmas = extract_into_tensor(sigmas, timesteps, sample.shape)
     if prediction_type == "epsilon":
@@ -122,15 +126,20 @@ def get_predicted_original_sample(model_output, timesteps, sample, prediction_ty
 
     return pred_x_0
 
+
 def append_dims(x, target_dims):
     """Appends dimensions to the end of a tensor until it has target_dims dimensions."""
     dims_to_append = target_dims - x.ndim
     if dims_to_append < 0:
-        raise ValueError(f"input has {x.ndim} dims but target_dims is {target_dims}, which is less")
+        raise ValueError(
+            f"input has {x.ndim} dims but target_dims is {target_dims}, which is less"
+        )
     return x[(...,) + (None,) * dims_to_append]
 
 
-def get_predicted_noise(model_output, timesteps, sample, prediction_type, alphas, sigmas):
+def get_predicted_noise(
+    model_output, timesteps, sample, prediction_type, alphas, sigmas
+):
     alphas = extract_into_tensor(alphas, timesteps, sample.shape)
     sigmas = extract_into_tensor(sigmas, timesteps, sample.shape)
     if prediction_type == "epsilon":
@@ -147,6 +156,7 @@ def get_predicted_noise(model_output, timesteps, sample, prediction_type, alphas
 
     return pred_epsilon
 
+
 @torch.no_grad()
 def update_ema(target_params, source_params, rate=0.99):
     """
@@ -160,8 +170,10 @@ def update_ema(target_params, source_params, rate=0.99):
     for targ, src in zip(target_params, source_params):
         targ.detach().mul_(rate).add_(src, alpha=1 - rate)
 
-def huber_loss(a, b, huber_c = 0.001):
+
+def huber_loss(a, b, huber_c=0.001):
     return torch.mean(torch.sqrt((a.float() - b.float()) ** 2 + huber_c**2) - huber_c)
+
 
 class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
     def __init__(
@@ -178,7 +190,6 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
         val_dataloaders: List[DataLoader] = None,
         vis_dataloaders: List[DataLoader] = None,
     ):
-        
         self.cfg: OmegaConf = cfg
         self.model: MarigoldDepthPipeline = model
         self.device = device
@@ -193,17 +204,18 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
         self.vis_loaders: List[DataLoader] = vis_dataloaders
         self.accumulation_steps: int = accumulation_steps
 
-        #load models
+        # load models
 
-        self.model.scheduler = LCMScheduler.from_pretrained(cfg.model.pretrained_path, subfolder="scheduler")
+        self.model.scheduler = LCMScheduler.from_pretrained(
+            cfg.model.pretrained_path, subfolder="scheduler"
+        )
 
+        self.teacher_unet = UNet2DConditionModel.from_pretrained(
+            cfg.model.pretrained_path, subfolder="unet"
+        )
 
-        self.teacher_unet = UNet2DConditionModel.from_pretrained(cfg.model.pretrained_path, subfolder="unet")
-        
         self.target_unet = UNet2DConditionModel(**self.teacher_unet.config)
         self.target_unet.load_state_dict(self.model.unet.state_dict())
-
-
 
         # Encode empty text prompt
         self.model.encode_empty_text()
@@ -212,15 +224,13 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
         self.model.unet.enable_xformers_memory_efficient_attention()
         self.teacher_unet.enable_xformers_memory_efficient_attention()
         self.target_unet.enable_xformers_memory_efficient_attention()
-        
+
         # Trainability
         self.model.vae.requires_grad_(False)
         self.model.text_encoder.requires_grad_(False)
         self.model.unet.requires_grad_(True)
         self.teacher_unet.requires_grad_(False)
         self.target_unet.requires_grad_(False)
-
-
 
         # Optimizer !should be defined after input layer is adapted
         lr = self.cfg.lr
@@ -291,7 +301,7 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
         self.in_evaluation = False
         self.global_seed_sequence: List = []  # consistent global seed sequence, used to seed random generator, to ensure consistency when resuming
 
-        # LCM parameters 
+        # LCM parameters
         self.ema_decay = cfg.trainer.ema_decay
         self.num_ddim_timesteps = cfg.trainer.num_ddim_timesteps
         self.max_grad_norm = 1.0
@@ -302,10 +312,14 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
             timesteps=self.training_noise_scheduler.config.num_train_timesteps,
             ddim_timesteps=self.num_ddim_timesteps,
         ).to(self.device)
-        self.alpha_schedule = torch.sqrt(self.training_noise_scheduler.alphas_cumprod).to(self.device)
-        self.sigma_schedule = torch.sqrt(1 - self.training_noise_scheduler.alphas_cumprod).to(self.device)
+        self.alpha_schedule = torch.sqrt(
+            self.training_noise_scheduler.alphas_cumprod
+        ).to(self.device)
+        self.sigma_schedule = torch.sqrt(
+            1 - self.training_noise_scheduler.alphas_cumprod
+        ).to(self.device)
         self.save_target = cfg.trainer.save_target
-        
+
     def train(self, t_end=None):
         logging.info("Start training")
 
@@ -369,20 +383,31 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
 
                 # 2. Sample a random timestep for each image t_n from the ODE solver timesteps without bias.
                 # For the DDIM solver, the timestep schedule is [T - 1, T - k - 1, T - 2 * k - 1, ...]
-                topk = self.training_noise_scheduler.config.num_train_timesteps // self.num_ddim_timesteps
-                index = torch.randint(0, self.num_ddim_timesteps, (batch_size,), device=rgb_latent.device).long()
+                topk = (
+                    self.training_noise_scheduler.config.num_train_timesteps
+                    // self.num_ddim_timesteps
+                )
+                index = torch.randint(
+                    0, self.num_ddim_timesteps, (batch_size,), device=rgb_latent.device
+                ).long()
                 start_timesteps = self.solver.ddim_timesteps[index].to(device)
                 timesteps = start_timesteps - topk
-                timesteps = torch.where(timesteps < 0, torch.zeros_like(timesteps), timesteps)
+                timesteps = torch.where(
+                    timesteps < 0, torch.zeros_like(timesteps), timesteps
+                )
 
                 c_skip_start, c_out_start = scalings_for_boundary_conditions(
                     start_timesteps, timestep_scaling=self.timestep_scaling_factor
                 )
-                c_skip_start, c_out_start = [append_dims(x, rgb_latent.ndim) for x in [c_skip_start, c_out_start]]
+                c_skip_start, c_out_start = [
+                    append_dims(x, rgb_latent.ndim) for x in [c_skip_start, c_out_start]
+                ]
                 c_skip, c_out = scalings_for_boundary_conditions(
                     timesteps, timestep_scaling=self.timestep_scaling_factor
                 )
-                c_skip, c_out = [append_dims(x, rgb_latent.ndim) for x in [c_skip, c_out]]
+                c_skip, c_out = [
+                    append_dims(x, rgb_latent.ndim) for x in [c_skip, c_out]
+                ]
 
                 # Sample noise
 
@@ -410,12 +435,9 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
 
                 # Predict the noise residual
                 model_pred = self.model.unet(
-                    cat_latents, 
-                    start_timesteps, 
-                    text_embed
+                    cat_latents, start_timesteps, text_embed
                 ).sample  # [B, 4, h, w]
 
-                
                 if torch.isnan(model_pred).any():
                     logging.warning("model_pred contains NaN.")
 
@@ -427,15 +449,15 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
                     self.alpha_schedule,
                     self.sigma_schedule,
                 )  # [B, 4, h, w]
-                
-                prediction = c_skip_start * noisy_latents + c_out_start * pred_x_0  # [B, 4, h, w]
+
+                prediction = (
+                    c_skip_start * noisy_latents + c_out_start * pred_x_0
+                )  # [B, 4, h, w]
 
                 with torch.no_grad():
                     # 1. Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
                     cond_teacher_output = self.teacher_unet(
-                        cat_latents,
-                        start_timesteps,
-                        encoder_hidden_states = text_embed
+                        cat_latents, start_timesteps, encoder_hidden_states=text_embed
                     ).sample  # [B, 4, h, w]
                     teacher_pred_x0 = get_predicted_original_sample(
                         cond_teacher_output,
@@ -454,17 +476,18 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
                         self.sigma_schedule,
                     )  # [B, 4, h, w]
 
-                    x_prev = self.solver.ddim_step(teacher_pred_x0, teacher_pred_noise, index).to(device) # [B, 4, h, w]
-                
+                    x_prev = self.solver.ddim_step(
+                        teacher_pred_x0, teacher_pred_noise, index
+                    ).to(device)  # [B, 4, h, w]
+
                 with torch.no_grad():
-                    
-                    model_input_prev = torch.cat([rgb_latent, x_prev], dim=1)  # [B, 8, h, w]
+                    model_input_prev = torch.cat(
+                        [rgb_latent, x_prev], dim=1
+                    )  # [B, 8, h, w]
                     model_input_prev = model_input_prev.float()
-                
+
                     target_noise_pred = self.target_unet(
-                        model_input_prev,
-                        timesteps,
-                        text_embed
+                        model_input_prev, timesteps, text_embed
                     ).sample  # [B, 4, h, w]
                     target_pred_x0 = get_predicted_original_sample(
                         target_noise_pred,
@@ -477,14 +500,13 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
                     target = c_skip * x_prev + c_out * target_pred_x0  # [B, 4, h, w]
 
                 if self.gt_mask_type is not None:
-                    loss = huber_loss(prediction[valid_mask_down], 
-                                      target[valid_mask_down],  
-                                      huber_c = self.huber_c) 
+                    loss = huber_loss(
+                        prediction[valid_mask_down],
+                        target[valid_mask_down],
+                        huber_c=self.huber_c,
+                    )
                 else:
-                    loss = huber_loss(prediction, 
-                                      target,  
-                                      huber_c = self.huber_c) 
-
+                    loss = huber_loss(prediction, target, huber_c=self.huber_c)
 
                 self.train_metrics.update("loss", loss.item())
 
@@ -497,12 +519,18 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
 
                 # Perform optimization step
                 if accumulated_step >= self.gradient_accumulation_steps:
-                    torch.nn.utils.clip_grad_norm_(self.model.unet.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.unet.parameters(), self.max_grad_norm
+                    )
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
 
-                    update_ema(self.target_unet.parameters(), self.model.unet.parameters(), self.ema_decay)
+                    update_ema(
+                        self.target_unet.parameters(),
+                        self.model.unet.parameters(),
+                        self.ema_decay,
+                    )
 
                     accumulated_step = 0
 
@@ -554,7 +582,6 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
 
             # Epoch end
             self.n_batch_in_epoch = 0
-
 
     def validate(self):
         for i, val_loader in enumerate(self.val_loaders):
@@ -756,7 +783,6 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
 
         return metric_tracker.result()
 
-
     def save_checkpoint(self, ckpt_name, save_train_state):
         ckpt_dir = os.path.join(self.out_dir_ckpt, ckpt_name)
         logging.info(f"Saving checkpoint to: {ckpt_dir}")
@@ -819,8 +845,9 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
         logging.info(f"UNet parameters are loaded from {_model_path}")
 
         if self.save_target:
-
-            _target_model_path = os.path.join(ckpt_path, "target_unet", "diffusion_pytorch_model.bin")
+            _target_model_path = os.path.join(
+                ckpt_path, "target_unet", "diffusion_pytorch_model.bin"
+            )
             self.target_unet.load_state_dict(
                 torch.load(_target_model_path, map_location=self.device)
             )
@@ -844,7 +871,6 @@ class MarigoldDepthLCMTrainer(MarigoldDepthTrainer):
             if resume_lr_scheduler:
                 self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
                 logging.info(f"LR scheduler state is loaded from {ckpt_path}")
-        
 
         logging.info(
             f"Checkpoint loaded from: {ckpt_path}. Resume from iteration {self.effective_iter} (epoch {self.epoch})"

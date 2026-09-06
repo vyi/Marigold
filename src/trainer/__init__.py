@@ -38,8 +38,7 @@ trainer_cls_name_dict = {
     "MarigoldDepthTrainer": MarigoldDepthTrainer,
     "MarigoldIIDTrainer": MarigoldIIDTrainer,
     "MarigoldNormalsTrainer": MarigoldNormalsTrainer,
-    "MarigoldDepthLCMTrainer": MarigoldDepthLCMTrainer
-
+    "MarigoldDepthLCMTrainer": MarigoldDepthLCMTrainer,
 }
 
 
